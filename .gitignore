@@ -210,3 +210,4 @@ __marimo__/
 # Local configuration files
 data/project-sources/
 output/
+data/codeql-dbs/
