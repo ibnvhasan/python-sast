@@ -1,0 +1,10 @@
+name: python_sast
+dependencies:
+  - python=3.10
+  - pandas
+  - tqdm
+  - pytorch
+  - transformers
+  - requests
+  - openai
+  - anthropic
