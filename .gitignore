@@ -207,7 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 
-# Local configuration files
+# Custom Ignore Patterns
+.DS_Store
 data/project-sources/
 output/
 data/codeql-dbs/
+*.lock.yml

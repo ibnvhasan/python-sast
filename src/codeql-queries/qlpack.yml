@@ -1,0 +1,5 @@
+name: pysast-queries
+version: 1.0.0
+description: Enhanced Python queries for SAST analysis
+dependencies:
+  codeql/python-all: "*"
