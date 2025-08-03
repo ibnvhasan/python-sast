@@ -72,7 +72,7 @@ class GPTModel(LLM):
 
 
 if __name__ == '__main__':
-    from prompts import SYSTEM_PROMPTS, USER_PROMPTS
+    from src.prompts import SYSTEM_PROMPTS, USER_PROMPTS
     gpt=GPTModel('gpt-4', None)
     system_prompt=SYSTEM_PROMPTS['SINK']
     user_prompt=USER_PROMPTS["SINK"].format(cwe_description="Command Injection",

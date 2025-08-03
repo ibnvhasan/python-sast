@@ -10,3 +10,4 @@ dependencies:
   - anthropic
   - asyncio
   - dataclasses
+  - accelerate

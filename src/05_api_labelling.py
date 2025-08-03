@@ -5,10 +5,31 @@ This module provides functionality to prompt LLMs (either online or offline from
 to label collected candidate APIs from the previous stage. The candidate APIs are expected 
 to be located in <project_root>/output/project_name/api_candidates/.
 
+IRIS Methodology Implementation:
+This implementation follows the IRIS framework which includes TWO stages of labeling:
+
+Stage 1 (Implemented): API Candidate Labeling
+- Labels API methods as source, sink, or taint-propagator
+- Processes APIs in batches with CWE-specific context
+- Uses vulnerability-specific prompts and examples
+
+Stage 2 (Future): Function Parameters Labeling  
+- Labels individual parameters within function calls
+- Requires CodeQL queries to collect function parameters (NOT YET IMPLEMENTED)
+- Would process parameter-level taint analysis
+
+Note: Currently only Stage 1 is implemented. Stage 2 requires additional CodeQL queries
+to collect function parameters from the codebase.
+
 Key Features:
 - Supports configurable number of API candidates to process (default: 300 APIs per project)
-- Supports multiple LLM models (default: GPT-4.1, requires OPENAI_API_KEY environment variable)
+- Supports multiple LLM models:
+  * GPT models: gpt-4.1, gpt-4, gpt-3.5 (requires OPENAI_API_KEY)
+  * DeepSeek models: deepseek-r1-7b, deepseekcoder-33b, deepseekcoder-7b, deepseekcoder-v2-15b
+  * Qwen models: qwen2.5-coder-1.5b, qwen2.5-coder-7b, qwen2.5-14b, qwen2.5-32b, qwen2.5-72b
+  * CodeLlama models: codellama-7b-instruct, codellama-13b-instruct, codellama-34b-instruct, codellama-70b-instruct
 - Processes APIs in configurable batches (default: 30 APIs per batch)
+- User-configurable run IDs with auto-increment (default: "0")
 - Stores prompts and results in organized directory structure
 - Converts results to JSON format with statistics
 
@@ -17,16 +38,21 @@ Configuration:
 - LLM model configurations: /src/models/
 
 Output Structure:
-- Prompts: output/project_name/analysis/model_name_prompts/
-- Raw results: output/project_name/analysis/model_name_results/run_id_xxx/filenames.txt
-- JSON results: Converted from txt files with accompanying statistics
+- Prompts: output/project_name/api_labelling/model_name_run_id/prompts/
+- Raw results: output/project_name/api_labelling/model_name_run_id/results/
+- JSON results: output/project_name/api_labelling/model_name_run_id/final_results.json
 
 Inspired by: IRIS framework
 
 Arguments:
 - Number of candidates to process per project (default: 300)
-- LLM model selection (default: GPT-4.1)
+- LLM model selection (default: gpt-4.1)
+  * GPT: gpt-4.1, gpt-4, gpt-3.5
+  * DeepSeek: deepseek-r1-7b, deepseekcoder-33b, deepseekcoder-7b, deepseekcoder-v2-15b  
+  * Qwen: qwen2.5-coder-1.5b, qwen2.5-coder-7b, qwen2.5-14b, qwen2.5-32b, qwen2.5-72b
+  * CodeLlama: codellama-7b-instruct, codellama-13b-instruct, codellama-34b-instruct, codellama-70b-instruct
 - Batch size for API processing (default: 30 APIs per batch)
+- Run ID for organizing multiple runs (default: "0", auto-increments if exists)
 """
 
 
@@ -36,7 +62,6 @@ import os
 import time
 from pathlib import Path
 from typing import List, Dict, Any
-from uuid import uuid4
 
 from prompts import API_LABELLING_SYSTEM_PROMPT, API_LABELLING_USER_PROMPT
 
@@ -44,12 +69,39 @@ from prompts import API_LABELLING_SYSTEM_PROMPT, API_LABELLING_USER_PROMPT
 class APILabeller:
     """Main class for API candidate labelling using LLMs."""
     
-    def __init__(self, model_name: str = "gpt-4.1", max_candidates: int = 300, batch_size: int = 30):
+    def __init__(self, model_name: str = "gpt-4.1", max_candidates: int = 300, batch_size: int = 30, run_id: str = "0"):
         self.model_name = model_name
         self.max_candidates = max_candidates
         self.batch_size = batch_size
+        self.run_id = run_id
         self.root_dir = Path(__file__).parent.parent
         self.output_dir = self.root_dir / "output"
+    
+    def get_final_run_id(self, project_name: str) -> str:
+        """Get final run_id with auto-increment if needed."""
+        base_dir = self.output_dir / project_name / "api_labelling"
+        
+        if not base_dir.exists():
+            return self.run_id
+        
+        # Check if run_id already exists
+        target_dir = base_dir / f"{self.model_name}_{self.run_id}"
+        if not target_dir.exists():
+            return self.run_id
+        
+        # Auto-increment if exists
+        if self.run_id.isdigit():
+            # If numeric, increment
+            i = int(self.run_id)
+            while (base_dir / f"{self.model_name}_{i}").exists():
+                i += 1
+            return str(i)
+        else:
+            # If string, append number
+            i = 1
+            while (base_dir / f"{self.model_name}_{self.run_id}_{i}").exists():
+                i += 1
+            return f"{self.run_id}_{i}"
         
     def list_available_projects(self) -> List[str]:
         """List projects that have api_candidates."""
@@ -231,15 +283,32 @@ Return a JSON array with analysis for ALL {len(batch)} APIs listed above."""
             logger = logging.getLogger(__name__)
         
         # Dynamically import model based on name
-        if self.model_name.startswith('gpt'):
-            from models.gpt import GPTModel
-            return GPTModel(self.model_name, logger)
-        elif 'deepseek' in self.model_name:
-            from models.deepseek import DeepSeekModel
-            return DeepSeekModel(self.model_name, logger)
-        # Add more models as needed
-        else:
-            raise ValueError(f"❌ Unsupported model: {self.model_name}")
+        try:
+            if self.model_name.startswith('gpt'):
+                from models.gpt import GPTModel
+                return GPTModel(self.model_name, logger)
+            elif 'deepseek' in self.model_name.lower():
+                from models.deepseek import DeepSeekModel
+                return DeepSeekModel(self.model_name, logger)
+            elif 'qwen' in self.model_name.lower():
+                from models.qwen import QwenModel
+                return QwenModel(self.model_name, logger)
+            elif 'codellama' in self.model_name.lower():
+                from models.codellama import CodeLlamaModel
+                return CodeLlamaModel(self.model_name, logger)
+            # Add more models as needed
+            else:
+                raise ValueError(f"❌ Unsupported model: {self.model_name}")
+        except Exception as e:
+            print(f"❌ Failed to initialize model '{self.model_name}': {e}")
+            print(f"💡 Available DeepSeek models: deepseek-r1-7b, deepseekcoder-33b, deepseekcoder-7b, deepseekcoder-v2-15b")
+            print(f"💡 Available Qwen models: qwen2.5-coder-1.5b, qwen2.5-coder-7b, qwen2.5-14b, qwen2.5-32b, qwen2.5-72b")
+            print(f"💡 Available CodeLlama models: codellama-7b-instruct, codellama-13b-instruct, codellama-34b-instruct, codellama-70b-instruct")
+            print(f"💡 Available GPT models: gpt-4.1, gpt-4, gpt-3.5")
+            print(f"💡 Make sure you have the required dependencies installed:")
+            print(f"   - For DeepSeek/Qwen/CodeLlama: pip install transformers torch accelerate")
+            print(f"   - For GPT: Set OPENAI_API_KEY environment variable")
+            raise
     
     def parse_json_response(self, response: str, expected_count: int = 0) -> List[Dict[str, Any]]:
         """Parse JSON response from LLM (robust parsing like IRIS)."""
@@ -299,11 +368,19 @@ Return a JSON array with analysis for ALL {len(batch)} APIs listed above."""
     def process_project(self, project_name: str) -> Dict[str, Any]:
         """Process a single project through the labelling pipeline."""
         print(f"\n🚀 Processing project: {project_name}")
-        run_id = str(uuid4())[:8]
+        
+        # NOTE: IRIS methodology includes two stages of labeling:
+        # 1. API candidate labeling (this stage) - Label API methods as source/sink/taint-propagator
+        # 2. Function parameters labeling (future stage) - Label individual parameters within functions
+        # 
+        # The second stage requires CodeQL queries to collect function parameters,
+        # which are not yet implemented. This stage focuses on API candidate labeling only.
+        
+        final_run_id = self.get_final_run_id(project_name)
         start_time = time.time()
         
         # Create output directories
-        base_dir = self.output_dir / project_name / "api_labelling" / f"{self.model_name}_{run_id}"
+        base_dir = self.output_dir / project_name / "api_labelling" / f"{self.model_name}_run_{final_run_id}"
         prompts_dir = base_dir / "prompts"
         results_dir = base_dir / "results"
         prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -361,7 +438,7 @@ Return a JSON array with analysis for ALL {len(batch)} APIs listed above."""
         final_results = {
             "project": project_name,
             "model": self.model_name,
-            "run_id": run_id,
+            "run_id": final_run_id,
             "timestamp": time.time(),
             "processing_time": time.time() - start_time,
             "statistics": stats,
@@ -382,11 +459,12 @@ def main():
     parser.add_argument("--model", default="gpt-4.1", help="LLM model to use")
     parser.add_argument("--max-candidates", type=int, default=300, help="Max candidates per project")
     parser.add_argument("--batch-size", type=int, default=30, help="Batch size for processing")
+    parser.add_argument("--run-id", default="0", help="Run ID (default: 0, auto-increments if exists)")
     parser.add_argument("--list-projects", action="store_true", help="List available projects")
     
     args = parser.parse_args()
     
-    labeller = APILabeller(args.model, args.max_candidates, args.batch_size)
+    labeller = APILabeller(args.model, args.max_candidates, args.batch_size, args.run_id)
     
     if args.list_projects:
         projects = labeller.list_available_projects()
