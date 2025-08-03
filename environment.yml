@@ -8,3 +8,5 @@ dependencies:
   - requests
   - openai
   - anthropic
+  - asyncio
+  - dataclasses
