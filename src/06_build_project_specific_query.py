@@ -236,6 +236,10 @@ def build_sources_qll(entries: List[Dict[str, Any]]) -> str:
     body = "false" if not conditions else " or\n    ".join(conditions)
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
+import semmle.python.Expr
+import semmle.python.ast.Call
+import semmle.python.ast.Name
+import semmle.python.ast.Attribute
 private import semmle.python.dataflow.new.DataFlow
 
 predicate isGPTDetectedSource(DataFlow::Node src) {{
@@ -341,6 +345,10 @@ def build_sinks_qll(entries: List[Dict[str, Any]]) -> str:
     body = "false" if not conditions else " or\n    ".join(conditions)
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
+import semmle.python.Expr
+import semmle.python.ast.Call
+import semmle.python.ast.Name
+import semmle.python.ast.Attribute
 private import semmle.python.dataflow.new.DataFlow
 
 predicate isGPTDetectedSink(DataFlow::Node snk) {{
@@ -416,6 +424,10 @@ def build_summaries_qll(entries: List[Dict[str, Any]]) -> str:
     body = "false" if not conditions else " or\n    ".join(conditions)
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
+import semmle.python.Expr
+import semmle.python.ast.Call
+import semmle.python.ast.Name
+import semmle.python.ast.Attribute
 private import semmle.python.dataflow.new.DataFlow
 
 predicate isGPTDetectedStep(DataFlow::Node prev, DataFlow::Node next) {{
@@ -443,6 +455,10 @@ import python
 import semmle.python.dataflow.new.DataFlow
 import semmle.python.dataflow.new.TaintTracking
 import semmle.python.security.dataflow.PathInjectionQuery
+import semmle.python.Expr
+import semmle.python.ast.Call
+import semmle.python.ast.Name
+import semmle.python.ast.Attribute
 import MySources
 import MySinks
 import MySummaries
@@ -572,6 +588,10 @@ def build_cwe_022_query() -> str:
 
 import python
 import semmle.python.dataflow.new.DataFlow
+import semmle.python.Expr
+import semmle.python.ast.Call
+import semmle.python.ast.Name
+import semmle.python.ast.Attribute
 import MyTaintedPathQuery
 import MyTaintedPathFlow::PathGraph
 
