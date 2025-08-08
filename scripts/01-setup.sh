@@ -50,21 +50,23 @@ if ! command -v codeql &> /dev/null; then
     if [[ "$install_codeql" == "y" ]]; then
         # Install CodeQL CLI
         echo "Installing CodeQL CLI..."
-        echo "Downloading CodeQL Bundle from GitHub..."
-        wget https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.22.2/codeql-bundle-linux64.tar.gz
+        echo "Downloading CodeQL CLI from GitHub..."
+        wget https://github.com/github/codeql-cli-binaries/releases/download/v2.22.3/codeql-linux64.zip
         if [[ $? -ne 0 ]]; then
-            echo "Failed to download CodeQL Bundle. Please check your internet connection."
+            echo "Failed to download CodeQL CLI. Please check your internet connection."
             exit 1
         fi
-        echo "Extracting CodeQL Bundle..."
-        tar -xzf codeql-bundle-linux64.tar.gz
+        echo "Extracting CodeQL CLI..."
+        tar -xf codeql-linux64.zip
         if [[ $? -ne 0 ]]; then
-            echo "Failed to extract CodeQL Bundle. Please check the downloaded file."
+            echo "Failed to extract CodeQL CLI. Please check the downloaded file."
             exit 1
         fi
         echo "CodeQL CLI installed successfully."
+        echo "Setting the environment variable for CodeQL CLI..."
+        echo 'bash -c "export PATH=$(pwd)/codeql:$PATH"'
         echo "You can now run 'codeql' command."
-        rm codeql-bundle-linux64.tar.gz
+        rm codeql-linux64.zip
     else
         # Option 2: Quit setup and ask the user to install CodeQL CLI manually
         echo "Please install CodeQL CLI manually from https://github.com/github/codeql-cli-binaries/releases"
@@ -89,6 +91,17 @@ if ! codeql resolve languages &> /dev/null; then
 else
     echo "CodeQL language support is already installed."
 fi
+echo ""
+
+# Installing qlpack
+echo "=============================================================="
+echo "Step 04 Installing QLPack"
+echo "=============================================================="
+
+if ! cd src/codeql-queries && codeql pack install; then
+    echo "Error installing QLPack. Please check your CodeQL installation."
+fi 
+    echo "QLPack installed successfully."
 echo ""
 
 # Check GPU availability
