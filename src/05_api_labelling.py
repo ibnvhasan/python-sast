@@ -53,6 +53,10 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import re
+try:
+    import torch  # used if transformers backend is selected
+except Exception:
+    torch = None
 
 # Enhanced imports for better model support
 try:
@@ -60,8 +64,19 @@ try:
     load_dotenv()
 except ImportError:
     pass
+from iris_prompts import build_api_labeling_prompts
 
-from prompts import API_LABELLING_SYSTEM_PROMPT, API_LABELLING_USER_PROMPT
+# Import for CodeQL query generation
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_queries", 
+                                                   os.path.join(os.path.dirname(__file__), "06_build_project_specific_query.py"))
+    build_queries_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build_queries_module)
+    build_project_specific_queries = build_queries_module.build_project_specific_queries
+except Exception:
+    print("⚠️  Warning: Could not import build_project_specific_queries - CodeQL query generation will be skipped")
+    build_project_specific_queries = None
 
 
 @dataclass
@@ -126,15 +141,32 @@ class EnhancedAPILabeller:
     """Enhanced API candidate labelling with multiple LLM support and robust error handling."""
     
     def __init__(self, model_name: str = "gpt-4", max_candidates: int = 300, 
-                 batch_size: int = 30, run_id: str = "0", max_retries: int = 3):
+                 batch_size: int = 30, run_id: str = "0", max_retries: int = 3,
+                 allow_remote: bool = False,
+                 hf_4bit: bool = False,
+                 max_new_tokens: int = 256,
+                 temperature: float = 0.0,
+                 max_input_tokens: int = 8192,
+                 no_codeql: bool = False):
         self.model_name = model_name
         self.max_candidates = max_candidates
         self.batch_size = batch_size
         self.run_id = run_id
         self.max_retries = max_retries
+        # By default, enforce offline/local HF models only unless explicitly allowed
+        self.allow_remote = allow_remote
+        self.hf_4bit = hf_4bit
+        self.no_codeql = no_codeql
         self.root_dir = Path(__file__).parent.parent
         self.output_dir = self.root_dir / "output"
         self.stats = LabelingStats()
+
+        # Generation configuration
+        self.generation_hparams = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "max_input_tokens": max_input_tokens,
+        }
         
         # Model setup
         self.model = None
@@ -234,8 +266,13 @@ class EnhancedAPILabeller:
             from transformers import AutoTokenizer, AutoModelForCausalLM
             import torch
             
-            print(f"🔄 Loading HuggingFace model: {self.model_name}")
-            tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            # Honor HF_HOME cache directory if provided
+            hf_cache = os.environ.get("HF_HOME")
+            if hf_cache:
+                print(f"� Using HF cache dir: {hf_cache}")
+            
+            print(f"�🔄 Loading HuggingFace model: {self.model_name}")
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name, cache_dir=hf_cache)
             
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -245,7 +282,8 @@ class EnhancedAPILabeller:
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                cache_dir=hf_cache
             )
             
             print(f"✅ Model loaded. Using device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
@@ -258,6 +296,14 @@ class EnhancedAPILabeller:
         print(f"🤖 Initializing {self.model_type} model: {self.model_name}")
         
         try:
+            if not self.allow_remote and self.model_type in {"openai", "anthropic", "google"}:
+                raise RuntimeError(
+                    "Remote API models are disabled. Use a local HuggingFace model (e.g., deepseek-r1-7b, qwen2.5-coder-7b), "
+                    "or rerun with --allow-remote to enable cloud APIs."
+                )
+            # Configure 4-bit quantization preference for HF
+            if self.model_type == 'huggingface':
+                os.environ["HF_LOAD_4BIT"] = "1" if self.hf_4bit else "0"
             if self.model_type == 'openai':
                 self.model = self._setup_openai_model()
             elif self.model_type == 'anthropic':
@@ -269,6 +315,19 @@ class EnhancedAPILabeller:
             else:  # huggingface
                 self.model = self._setup_huggingface_model()
             
+            # Apply generation hyperparameters if supported by the model wrapper
+            try:
+                if hasattr(self.model, 'model_hyperparams'):
+                    self.model.model_hyperparams.update({
+                        'max_new_tokens': self.generation_hparams['max_new_tokens'],
+                        'temperature': self.generation_hparams['temperature'],
+                        'max_input_tokens': self.generation_hparams['max_input_tokens'],
+                        'top_p': 1.0,
+                        'do_sample': False,
+                    })
+            except Exception:
+                pass
+
             print(f"✅ Model initialized successfully")
             return self.model
             
@@ -359,21 +418,33 @@ class EnhancedAPILabeller:
                 model = self.model["model"]
                 
                 full_prompt = f"{system_prompt}\n\n{user_prompt}"
-                inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=2048)
+                inputs = tokenizer(full_prompt, return_tensors="pt", truncation=True, max_length=self.generation_hparams.get('max_input_tokens', 2048))
                 
+                if torch is None:
+                    raise RuntimeError("torch not available for local transformers generation")
                 with torch.no_grad():
                     outputs = model.generate(
                         **inputs,
-                        max_new_tokens=1000,
-                        temperature=0.1,
-                        pad_token_id=tokenizer.eos_token_id
+                        max_new_tokens=self.generation_hparams.get('max_new_tokens', 256),
+                        temperature=self.generation_hparams.get('temperature', 0.0),
+                        do_sample=False,
+                        pad_token_id=tokenizer.eos_token_id,
+                        eos_token_id=tokenizer.eos_token_id
                     )
                 
                 response = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 return response[len(full_prompt):].strip()
             else:
-                # Use existing model class
-                return self.model.generate(system_prompt, user_prompt)
+                # Use existing model class that implements predict(chat_messages)
+                chat_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+                try:
+                    # For GPT remote models, request strict JSON when supported
+                    return self.model.predict(chat_messages, expect_json=True)
+                except TypeError:
+                    return self.model.predict(chat_messages)
     
     def parse_json_response(self, response: str, expected_count: int = 0) -> List[Dict[str, Any]]:
         """Enhanced JSON response parsing with better error handling"""
@@ -533,73 +604,10 @@ class EnhancedAPILabeller:
         return cwe_configs.get(cwe_query, cwe_configs["cwe-078"])
 
     def create_prompt(self, batch: List[Dict[str, Any]], project_name: str) -> tuple[str, str]:
-        """Create enhanced IRIS-style system and user prompts for a batch."""
-        # Detect CWE from project name
+        """Create IRIS-style system and user prompts using the dedicated builder."""
         cwe_query = self.detect_cwe_from_project(project_name)
         cwe_config = self.get_cwe_config(cwe_query)
-        
-        # Enhanced system prompt with better instructions
-        system_prompt = """You are a security expert specializing in static analysis and vulnerability detection. \
-You are given a list of API methods to be labeled as potential taint sources, sinks, or taint propagators. \
-
-DEFINITIONS:
-- TAINT SOURCES: API methods that return data controlled by an attacker or external input (e.g., user input, file contents, network data)
-- TAINT SINKS: API methods that can cause security vulnerabilities when given malicious input (e.g., command execution, file operations, SQL queries)
-- TAINT PROPAGATORS: API methods that pass tainted data from input to output without sanitization (e.g., string operations, data transformations)
-
-IMPORTANT INSTRUCTIONS:
-1. Analyze ALL APIs provided in the input
-2. Consider the specific vulnerability context provided
-3. Return results as a JSON array with the exact format specified
-4. Each API must be classified as "source", "sink", or "taint-propagator"
-5. For sinks, specify which arguments are vulnerable in the "sink_args" field
-6. Use empty array [] for sink_args if the API is not a sink
-
-OUTPUT FORMAT - JSON array with objects like this:
-[
-  {
-    "package": "<package name>",
-    "class": "<class name>", 
-    "method": "<method name>",
-    "signature": "<method signature>",
-    "sink_args": ["<vulnerable_arg1>", "<vulnerable_arg2>"] or [],
-    "type": "source" | "sink" | "taint-propagator"
-  }
-]
-
-CRITICAL: Return ONLY the JSON array. No explanations, no markdown, no additional text."""
-        
-        # Format examples (IRIS style)
-        examples_text = ""
-        for example in cwe_config["examples"]:
-            examples_text += f"{example['package']},{example.get('class', '')},{example['method']},{example['signature']}\n"
-        
-        # Format candidates
-        methods_text = ""
-        for candidate in batch:
-            package = candidate.get('package', '')
-            clazz = candidate.get('clazz', '')  
-            func = candidate.get('func', '')
-            signature = candidate.get('full_signature', func)
-            methods_text += f"{package},{clazz},{func},{signature}\n"
-        
-        # Enhanced user prompt with specific vulnerability context
-        user_prompt = f"""VULNERABILITY CONTEXT: {cwe_config['desc']} (CWE-{cwe_config['cwe_id']})
-
-{cwe_config['long_desc']}
-
-EXAMPLE SOURCE/SINK/TAINT-PROPAGATOR METHODS:
-{examples_text}
-
-APIS TO ANALYZE:
-Package,Class,Method,Signature
-{methods_text}
-
-Analyze each of the {len(batch)} APIs above for {cwe_config['desc']} vulnerabilities.
-For each API, determine if it's a source, sink, or taint-propagator.
-Return the analysis as a JSON array with {len(batch)} objects."""
-        
-        return system_prompt, user_prompt
+        return build_api_labeling_prompts(cwe_config, batch)
     
     def process_project(self, project_name: str) -> Dict[str, Any]:
         """Enhanced project processing with comprehensive error handling and statistics"""
@@ -639,12 +647,24 @@ Return the analysis as a JSON array with {len(batch)} objects."""
             print(f"\n⚡ Processing batch {batch_id + 1}/{len(batches)} ({len(batch)} APIs)")
             
             try:
+                # Dynamically size generation tokens to avoid truncated JSON
+                # Rough estimate: ~70 tokens per item; cap at 2048 for safety
+                dyn_max_new = min(2048, max(256, 70 * len(batch)))
+                # Apply to direct transformers path
+                self.generation_hparams['max_new_tokens'] = dyn_max_new
+                # Apply to wrapper models if available
+                try:
+                    if hasattr(self.model, 'model_hyperparams'):
+                        self.model.model_hyperparams['max_new_tokens'] = dyn_max_new
+                except Exception:
+                    pass
+
                 # Create and save prompts (IRIS style with CWE context)
                 system_prompt, user_prompt = self.create_prompt(batch, project_name)
                 
                 # Check prompt length for token limit warnings
                 total_prompt_length = len(system_prompt) + len(user_prompt)
-                print(f"📏 Prompt length: {total_prompt_length} characters")
+                print(f"📏 Prompt length: {total_prompt_length} characters; max_new_tokens={dyn_max_new}")
                 if total_prompt_length > 15000:
                     print(f"⚠️  Warning: Very long prompt, may exceed token limits")
                 
@@ -662,18 +682,38 @@ Return the analysis as a JSON array with {len(batch)} objects."""
                     f.write(response if response else "ERROR: No response after retries")
                 
                 # Parse response and update statistics
+                validated_results: List[Dict[str, Any]] = []
                 if response and response.strip():
                     parsed_results = self.parse_json_response(response, len(batch))
                     
-                    # Validate and enhance results
+                    # If parsing failed, try one strict re-prompt
+                    if not parsed_results:
+                        strict_user_prompt = (
+                            user_prompt
+                            + f"\n\nSTRICT MODE: Return ONLY a valid JSON array with exactly {len(batch)} objects. "
+                              "No prose, no markdown, no code fences."
+                        )
+                        response2 = self.query_model_with_retry(system_prompt, strict_user_prompt, batch_id)
+                        if response2 and response2.strip():
+                            parsed_results = self.parse_json_response(response2, len(batch))
+                            # Save second raw response too
+                            response_file2 = results_dir / f"batch_{batch_id}_raw_response_retry.txt"
+                            with open(response_file2, 'w') as f:
+                                f.write(response2)
+                    
+                    # Validate and enhance results (may still be empty)
                     validated_results = self._validate_and_enhance_results(parsed_results, batch)
                     
-                    all_results.extend(validated_results)
-                    self.stats.update_label_counts(validated_results)
-                    self.stats.successful_labels += len(validated_results)
-                    self.stats.successful_batches += 1
-                    
-                    print(f"✅ Batch {batch_id}: {len(validated_results)}/{len(batch)} APIs labeled successfully")
+                    if validated_results:
+                        all_results.extend(validated_results)
+                        self.stats.update_label_counts(validated_results)
+                        self.stats.successful_labels += len(validated_results)
+                        self.stats.successful_batches += 1
+                        print(f"✅ Batch {batch_id}: {len(validated_results)}/{len(batch)} APIs labeled successfully")
+                    else:
+                        print(f"❌ Batch {batch_id}: Failed to parse JSON after retry")
+                        self.stats.failed_labels += len(batch)
+                        self.stats.failed_batches += 1
                 else:
                     print(f"❌ Batch {batch_id}: Failed to get valid response")
                     self.stats.failed_labels += len(batch)
@@ -745,6 +785,26 @@ Return the analysis as a JSON array with {len(batch)} objects."""
         
         # Print comprehensive summary
         self._print_final_summary(final_results)
+        
+        # Build project-specific CodeQL queries (IRIS pattern)
+        if not self.no_codeql and build_project_specific_queries and all_results:
+            print(f"\n🔧 Building project-specific CodeQL queries...")
+            try:
+                success = build_project_specific_queries(project_name, str(self.output_dir))
+                if success:
+                    print(f"✅ Successfully generated CodeQL query files for {project_name}")
+                    print(f"📁 Query files location: {project_name}/api_labelling/*/custom_codeql_library/")
+                else:
+                    print(f"⚠️  Failed to generate CodeQL queries for {project_name}")
+            except Exception as e:
+                print(f"❌ Error generating CodeQL queries: {e}")
+                print(f"💡 You can manually run: python src/06_build_project_specific_query.py --project {project_name}")
+        elif self.no_codeql:
+            print(f"\n🔧 CodeQL query generation skipped (--no-codeql flag)")
+        elif not build_project_specific_queries:
+            print(f"\n💡 To generate CodeQL queries, run: python src/06_build_project_specific_query.py --project {project_name}")
+        elif not all_results:
+            print(f"\n⚠️  No labeled APIs found - skipping CodeQL query generation")
         
         return final_results
     
@@ -823,6 +883,13 @@ def main():
     parser.add_argument("--run-id", default="0", help="Run ID (default: 0, auto-increments if exists)")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum retry attempts per batch")
     parser.add_argument("--list-projects", action="store_true", help="List available projects")
+    parser.add_argument("--allow-remote", action="store_true", help="Allow remote/cloud LLM APIs (OpenAI/Anthropic/Google)")
+    parser.add_argument("--hf-4bit", action="store_true", default=False, help="Use 4-bit quantization for local HF models (default: off)")
+    parser.add_argument("--no-hf-4bit", dest="hf_4bit", action="store_false", help="Disable 4-bit quantization for local HF models")
+    parser.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate per response (speed control)")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
+    parser.add_argument("--max-input-tokens", type=int, default=8192, help="Max input tokens (truncation limit)")
+    parser.add_argument("--no-codeql", action="store_true", help="Skip automatic CodeQL query generation after API labeling")
     
     args = parser.parse_args()
     
@@ -831,7 +898,13 @@ def main():
         max_candidates=args.max_candidates, 
         batch_size=args.batch_size, 
         run_id=args.run_id,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        allow_remote=args.allow_remote,
+        hf_4bit=args.hf_4bit,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        max_input_tokens=args.max_input_tokens,
+        no_codeql=args.no_codeql
     )
     
     if args.list_projects:

@@ -1,7 +1,3 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import transformers
-import torch
-import models.config as config
 from utils.mylogger import MyLogger
 import os
 from models.llm import LLM
@@ -17,6 +13,9 @@ _model_name_map = {
 
 class QwenModel(LLM):
     def __init__(self, model_name, logger: MyLogger, **kwargs):
+        # Propagate HF cache dir if available
+        if os.environ.get("HF_HOME"):
+            os.environ.setdefault("HF_DATASETS_CACHE", os.environ["HF_HOME"])  # harmless if unused
         super().__init__(model_name, logger, _model_name_map, **kwargs)
         # Initialize terminators after pipeline is ready (only for non-GPT models)
         if hasattr(self, 'pipe') and self.pipe is not None:
@@ -32,18 +31,17 @@ class QwenModel(LLM):
        
         #prompt = f"<s>[INST] <<SYS>>\\n{system_prompt}\\n<</SYS>>\\n\\n{user_prompt}[/INST]"
         if batch_size > 0:
-            prompts = [self.pipe.tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True) for p in main_prompt]
-            self.model_hyperparams['temperature']=0.01
+            prompts = [
+                self.pipe.tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+                for p in main_prompt
+            ]
             return self.predict_main(prompts, batch_size=batch_size, no_progress_bar=no_progress_bar)
         else:
             prompt = self.pipe.tokenizer.apply_chat_template(
-            main_prompt, 
-            tokenize=False, 
-            add_generation_prompt=True
+                main_prompt,
+                tokenize=False,
+                add_generation_prompt=True
             )
-
-            #prompt = f"{user_prompt}"
             #inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to("cuda")
-            self.model_hyperparams['temperature']=0.01
             return self.predict_main(prompt, no_progress_bar=no_progress_bar)
 

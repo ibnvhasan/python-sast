@@ -1,5 +1,3 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import models.config as config
 from utils.mylogger import MyLogger
 import os
 from models.llm import LLM
@@ -14,6 +12,9 @@ _model_name_map = {
 
 class DeepSeekModel(LLM):
     def __init__(self, model_name, logger: MyLogger, **kwargs):
+        # Ensure HF cache dir is used if set
+        if os.environ.get("HF_HOME"):
+            os.environ.setdefault("HF_DATASETS_CACHE", os.environ["HF_HOME"])  # harmless if unused
         super().__init__(model_name, logger, _model_name_map, **kwargs)
         # Initialize terminators after pipeline is ready (only for non-GPT models)
         if hasattr(self, 'pipe') and self.pipe is not None:
@@ -36,7 +37,6 @@ class DeepSeekModel(LLM):
         if batch_size > 0:
             prompts = [self.pipe.tokenizer.apply_chat_template(rename(p), tokenize=False, add_generation_prompt=True) for p in main_prompt]
             #print(prompts[0])
-            self.model_hyperparams['temperature']=0.0
             return self.predict_main(prompts, batch_size=batch_size, no_progress_bar=no_progress_bar)
         else:
            
@@ -45,12 +45,11 @@ class DeepSeekModel(LLM):
             tokenize=False, 
             add_generation_prompt=True
             )
-            l=len(self.tokenizer.tokenize(prompt))
-            self.log("Prompt length:" +str(l))
-            limit=16000 if self.kwargs["max_input_tokens"] is None else self.kwargs["max_input_tokens"]
+            l = len(self.tokenizer.tokenize(prompt))
+            self.log("Prompt length:" + str(l))
+            limit = self.model_hyperparams.get("max_input_tokens", 16000)
             if l > limit:
                 return "Too long, skipping: "+str(l)
-            self.model_hyperparams['temperature']=0.01
             #print(prompt)
             return self.predict_main(prompt, no_progress_bar=no_progress_bar)
         

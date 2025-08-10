@@ -37,6 +37,14 @@ class LLM(ABC):
             import transformers
             import torch
             from transformers import AutoTokenizer, AutoModelForCausalLM
+            # Optional 4-bit quantization for speed/memory if bitsandbytes is available
+            try:
+                from transformers import BitsAndBytesConfig  # type: ignore
+                has_bnb = True
+            except Exception:
+                BitsAndBytesConfig = None  # type: ignore
+                has_bnb = False
+            import os
             
             # Get the actual model ID
             if self.model_name not in self.model_name_map:
@@ -46,15 +54,54 @@ class LLM(ABC):
             
             model_id = self.model_name_map[self.model_name]
             self.log_info(f"Loading HuggingFace model: {model_id}")
+            hf_cache = os.environ.get("HF_HOME")
+            if hf_cache:
+                self.log_info(f"Using HF cache dir: {hf_cache}")
             
             # Initialize tokenizer and model
-            self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-            self.model = AutoModelForCausalLM.from_pretrained(
+            # Tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
-                torch_dtype=torch.float16,
-                device_map="auto",
-                trust_remote_code=True
+                trust_remote_code=True,
+                cache_dir=hf_cache,
+                use_fast=True
             )
+
+            # Prefer 4-bit quantization on CUDA if available
+            quant_config = None
+            if torch.cuda.is_available() and has_bnb and os.environ.get("HF_LOAD_4BIT", "0") == "1":
+                try:
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16 if hasattr(torch, 'bfloat16') else torch.float16,
+                    )
+                    self.log_info("Using 4-bit quantization (bitsandbytes)")
+                except Exception as e:
+                    self.log_info(f"4-bit quantization not used: {e}")
+                    quant_config = None
+
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            device_map = "auto" if torch.cuda.is_available() else None
+
+            # Load model with optional quantization
+            if quant_config is not None:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map=device_map,
+                    trust_remote_code=True,
+                    cache_dir=hf_cache,
+                    quantization_config=quant_config
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=dtype,
+                    device_map=device_map,
+                    trust_remote_code=True,
+                    cache_dir=hf_cache
+                )
             
             # Create pipeline
             self.pipe = transformers.pipeline(
@@ -68,12 +115,13 @@ class LLM(ABC):
                 self.pipe.tokenizer.pad_token_id = self.pipe.tokenizer.eos_token_id
             self.pipe.tokenizer.padding_side = 'left'
             
-            # Set default hyperparameters
+            # Set default hyperparameters (tuned for speed/conciseness)
             self.model_hyperparams = {
-                'temperature': 0.01,
-                'top_p': 0.9,
-                'max_new_tokens': 1024,
-                'max_input_tokens': 16000
+                'temperature': 0.0,
+                'top_p': 1.0,
+                'max_new_tokens': 256,
+                'max_input_tokens': 8192,
+                'do_sample': False
             }
             
             self.log_info(f"Successfully initialized HuggingFace pipeline for {model_id}")
@@ -95,12 +143,12 @@ class LLM(ABC):
                 for p in prompt:
                     output = self.pipe(
                         p,
-                        max_new_tokens=self.model_hyperparams.get('max_new_tokens', 1024),
-                        temperature=self.model_hyperparams.get('temperature', 0.01),
-                        top_p=self.model_hyperparams.get('top_p', 0.9),
+                        max_new_tokens=self.model_hyperparams.get('max_new_tokens', 256),
+                        temperature=self.model_hyperparams.get('temperature', 0.0),
+                        top_p=self.model_hyperparams.get('top_p', 1.0),
                         pad_token_id=self.tokenizer.eos_token_id,
                         return_full_text=False,
-                        do_sample=True
+                        do_sample=self.model_hyperparams.get('do_sample', False)
                     )
                     results.append(output[0]['generated_text'])
                 return results
@@ -108,12 +156,12 @@ class LLM(ABC):
                 # Single prompt
                 output = self.pipe(
                     prompt,
-                    max_new_tokens=self.model_hyperparams.get('max_new_tokens', 1024),
-                    temperature=self.model_hyperparams.get('temperature', 0.01),
-                    top_p=self.model_hyperparams.get('top_p', 0.9),
+                    max_new_tokens=self.model_hyperparams.get('max_new_tokens', 256),
+                    temperature=self.model_hyperparams.get('temperature', 0.0),
+                    top_p=self.model_hyperparams.get('top_p', 1.0),
                     pad_token_id=self.tokenizer.eos_token_id,
                     return_full_text=False,
-                    do_sample=True
+                    do_sample=self.model_hyperparams.get('do_sample', False)
                 )
                 return output[0]['generated_text']
         except Exception as e:

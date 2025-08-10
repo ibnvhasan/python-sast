@@ -66,28 +66,42 @@ string getScopeContext(Call call) {
 /**
  * Get argument details for the function call
  */
-string getFunctionArguments(Call call) {
-    if count(call.getAnArg()) = 0
+// string getFunctionArguments(Call call) {
+//     if count(call.getAnArg()) = 0
+//     then
+//         result = "no_args"
+//     else 
+//         result = concat(int i, string arg |
+//             i in [0..count(call.getAnArg())-1] and
+//             (
+//                 if exists(call.getArg(i).(StringLiteral))
+//                 then arg = "str_literal"
+//                 else if exists(call.getArg(i).(IntegerLiteral))
+//                 then arg = "int_literal"
+//                 else if exists(call.getArg(i).(Name))
+//                 then arg = call.getArg(i).(Name).getId()
+//                 else arg = call.getArg(i).toString()
+//             ) |
+//             arg, ", " order by i
+//         )
+// }
+string getFullSignature(Function f) {
+    if f.getPositionalParameterCount() > 1
     then
-        result = "no_args"
-    else 
-        result = concat(int i, string arg |
-            i in [0..count(call.getAnArg())-1] and
-            (
-                if exists(call.getArg(i).(StringLiteral))
-                then arg = "str_literal"
-                else if exists(call.getArg(i).(IntegerLiteral))
-                then arg = "int_literal"
-                else if exists(call.getArg(i).(Name))
-                then arg = call.getArg(i).(Name).getId()
-                else arg = call.getArg(i).toString()
-            ) |
-            arg, ", " order by i
-        )
+        result = f.getName().toString() + "(" + 
+            concat( int i | i in [0..f.getPositionalParameterCount()] | f.getArg(i).getName(), ", " order by i ) + ")"
+    
+    else if f.getPositionalParameterCount() = 1
+    then
+        result = f.getName().toString() + "(" + f.getArg(0).getName().toString()  +  ")"
+    
+    else
+        result = f.getName().toString() + "()"
 }
 
 from 
-    Call call, 
+    Call call,
+    Function f,
     string module_name, 
     string function_name
 where 
@@ -96,8 +110,8 @@ where
     function_name = getFunctionName(call) and
   
     // Filter for external calls (not builtins, not standard library)
-    not isBuiltinFunction(function_name) and
-    not isStandardLibrary(module_name) and
+    // not isBuiltinFunction(function_name) and
+    // not isStandardLibrary(module_name) and
   
     // Filter out test files
     not call.getLocation().getFile().getRelativePath().matches("%test%") and
@@ -116,4 +130,5 @@ select
     call.getLocation().getFile().getRelativePath() as file_path,
     call.getLocation().getStartLine() as line_number,
     getScopeContext(call) as scope_context,
-    getFunctionArguments(call) as function_arguments
+    // getFunctionArguments(call) as function_arguments
+    getFullSignature(f) as full_singature

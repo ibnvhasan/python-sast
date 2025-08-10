@@ -3,19 +3,18 @@ This script aggregates raw responses from large language model (LLM) runs and
 converts them into Python CodeQL configuration files.  For each project in the
 specified root directory it searches for `api_labelling` folders.  Under
 `api_labelling` it expects one or more model/run directories such as
-`gpt-4_run_0` or `qwen2.5-coder-1.5b_run_0`.  Each run directory contains a
-`results` folder with a number of `batch_*_raw_response.txt` files.  Those
-raw response files are produced by IRIS when it queries an LLM to label
-external APIs as sources, sinks or taint‑propagators.
+`gpt-4_run_0` or `qwen2.5-coder-1.5b_run_0`.  Each run directory contains either:
+- `labeled_apis.json` file (new structure from 05_api_labelling.py)
+- `results` folder with `batch_*_raw_response.txt` files (legacy structure)
 
 The script performs three main tasks for each run:
 
-1. **Collect LLM output** – it reads every `*_raw_response.txt` file in
-   the run's `results` directory, extracts any JSON objects or arrays
-   contained within, and combines them into a single list.  The
-   aggregated list is deduplicated on the tuple of package, class,
+1. **Collect LLM output** – it reads either the `labeled_apis.json` file directly
+   or aggregates and parses `*_raw_response.txt` files from the `results` directory,
+   extracts any JSON objects or arrays, and combines them into a single list.
+   The aggregated list is deduplicated on the tuple of package, class,
    method, signature and type.  The combined list is then written to
-   `all_llm_results.json` under the run directory.
+   `labeled_apis.json` under the run directory (if not already present).
 
 2. **Separate by label** – from the aggregated list it builds three
    sub‑lists based on the ``type`` field of each entry: `source`,
@@ -23,9 +22,9 @@ The script performs three main tasks for each run:
 
 3. **Generate Python CodeQL library files** – for each run it creates a new
    subfolder named ``custom_codeql_library`` (if it does not already
-   exist) inside the run directory.  In this folder it writes five files:
-   ``MySources.qll``, ``MySinks.qll``, ``MyTaintPropagators.qll``,
-   ``MyTaintedPathQuery.qll``, and ``cwe-022wLLM.ql``.
+   exist) inside the run directory.  In this folder it writes six files:
+   ``MySources.qll``, ``MySinks.qll``, ``MySummaries.qll``,
+   ``MyTaintedPathQuery.qll``, ``cwe-022wLLM.ql``, and ``specs.model.yml``.
    These files define Python CodeQL configuration classes and queries
    which extend the standard `TaintTracking::Configuration`. The main
    query file ``cwe-022wLLM.ql`` can be run directly against a CodeQL
@@ -33,16 +32,32 @@ The script performs three main tasks for each run:
    sources and sinks. The templates aim to mirror the behaviour of the
    IRIS pipeline while remaining self‑contained and Python-specific.
 
+IRIS Integration:
+This module can be called automatically after API labeling completes in 
+05_api_labelling.py, or manually for specific projects. It follows the 
+IRIS pattern of converting LLM-labeled APIs into executable CodeQL queries.
+
 Usage:
 
 ```
-python 06_build_project_specific_query.py --root path/to/projects/root
+# Process all projects in output directory
+python 06_build_project_specific_query.py --root output
+
+# Process specific project only
+python 06_build_project_specific_query.py --project apache_airflow_cwe-22
+
+# List available runs without processing
+python 06_build_project_specific_query.py --list-runs
 ```
 
 When run without the ``--root`` argument the script defaults to the
 current working directory.  This is intentional so that the script can
 be dropped into the same folder as the top‑level project directories
 and run without additional arguments.
+
+Integration with API Labeling:
+The 05_api_labelling.py script automatically calls build_project_specific_queries()
+after completing API labeling, unless the --no-codeql flag is used.
 """
 
 from __future__ import annotations
@@ -752,7 +767,8 @@ def build_specs_model_yml(sources: List[Dict[str, Any]], sinks: List[Dict[str, A
 def process_run(run_path: str) -> None:
     """Process a single LLM run directory.
 
-    This function reads the labeled_apis.json file and generates the CodeQL library files.
+    This function reads either the labeled_apis.json file (new structure) or
+    aggregates raw response files (legacy structure) and generates the CodeQL library files.
 
     Parameters
     ----------
@@ -760,17 +776,35 @@ def process_run(run_path: str) -> None:
         The filesystem path to a run directory (e.g. ``.../api_labelling/gpt-4_run_0``).
     """
     labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
+    results_dir = os.path.join(run_path, "results")
     
-    if not os.path.exists(labeled_apis_path):
-        print(f"  ⚠️  No labeled_apis.json found in {run_path}")
-        return
-    
-    try:
-        with open(labeled_apis_path, "r", encoding="utf-8") as f:
-            aggregated = json.load(f)
-        print(f"  📄 Loaded {len(aggregated)} labeled APIs from labeled_apis.json")
-    except Exception as e:
-        print(f"  ❌ Failed to read labeled_apis.json: {e}")
+    # Try new structure first (labeled_apis.json)
+    if os.path.exists(labeled_apis_path):
+        try:
+            with open(labeled_apis_path, "r", encoding="utf-8") as f:
+                aggregated = json.load(f)
+            print(f"  📄 Loaded {len(aggregated)} labeled APIs from labeled_apis.json")
+        except Exception as e:
+            print(f"  ❌ Failed to read labeled_apis.json: {e}")
+            return
+    # Fall back to legacy structure (raw response files)
+    elif os.path.isdir(results_dir):
+        print(f"  📁 Processing legacy structure - aggregating raw response files from results/")
+        aggregated = aggregate_run_results(results_dir)
+        if not aggregated:
+            print(f"  ⚠️  No valid responses found in results directory")
+            return
+        print(f"  📄 Aggregated {len(aggregated)} entries from raw response files")
+        
+        # Save aggregated results for future runs
+        try:
+            with open(labeled_apis_path, "w", encoding="utf-8") as f:
+                json.dump(aggregated, f, indent=2, ensure_ascii=False)
+            print(f"  � Saved aggregated results to labeled_apis.json")
+        except Exception as e:
+            print(f"  ⚠️  Failed to save aggregated results: {e}")
+    else:
+        print(f"  ❌ No labeled_apis.json or results directory found in {run_path}")
         return
     
     # Split entries by type
@@ -868,6 +902,84 @@ def find_run_directories(root: str) -> List[str]:
     return run_paths
 
 
+def build_project_specific_queries(project_name: str, root: str = "output") -> bool:
+    """Build project-specific CodeQL queries from API labelling results.
+    
+    This function locates API labelling results for a specific project and generates
+    the corresponding CodeQL query files (sources.qll, sinks.qll, etc.) following
+    the IRIS pattern.
+    
+    Args:
+        project_name: Name of the project to build queries for
+        root: Root directory containing project folders (default: "output")
+        
+    Returns:
+        bool: True if queries were successfully built, False otherwise
+    """
+    print(f"🔍 Building CodeQL queries for project: {project_name}")
+    
+    # Find project directory
+    project_path = os.path.join(root, project_name)
+    if not os.path.isdir(project_path):
+        print(f"❌ Project directory not found: {project_path}")
+        return False
+    
+    # Find API labelling directory
+    api_labelling_path = os.path.join(project_path, "api_labelling")
+    if not os.path.isdir(api_labelling_path):
+        print(f"❌ No API labelling directory found: {api_labelling_path}")
+        return False
+    
+    # Find run directories with labeled results
+    run_dirs = []
+    for run_name in os.listdir(api_labelling_path):
+        run_path = os.path.join(api_labelling_path, run_name)
+        if not os.path.isdir(run_path):
+            continue
+        
+        # Check for labeled_apis.json (new structure) or results directory (old structure)
+        labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
+        results_dir = os.path.join(run_path, "results")
+        
+        if os.path.exists(labeled_apis_path) or os.path.isdir(results_dir):
+            run_dirs.append(run_path)
+    
+    if not run_dirs:
+        print(f"❌ No LLM run directories found in {api_labelling_path}")
+        print(f"💡 Expected structure: {project_name}/api_labelling/<model_run>/labeled_apis.json")
+        return False
+    
+    print(f"✅ Found {len(run_dirs)} LLM run directories for {project_name}:")
+    for run_dir in run_dirs:
+        run_name = os.path.basename(run_dir)
+        print(f"   📁 {run_name}")
+    
+    print(f"\n🚀 Processing LLM runs for {project_name}...")
+    processed_count = 0
+    
+    for run_path in run_dirs:
+        try:
+            process_run(run_path)
+            processed_count += 1
+            run_name = os.path.basename(run_path)
+            print(f"✅ Processed {project_name}/{run_name}")
+        except Exception as e:
+            run_name = os.path.basename(run_path)
+            print(f"❌ Failed to process {project_name}/{run_name}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    success = processed_count > 0
+    if success:
+        print(f"\n🎉 Completed! Processed {processed_count}/{len(run_dirs)} run directories for {project_name}.")
+        print(f"📁 Generated Python CodeQL libraries in: {project_name}/api_labelling/*/custom_codeql_library/")
+        print(f"📄 Files created: MySources.qll, MySinks.qll, MySummaries.qll, MyTaintedPathQuery.qll, cwe-022wLLM.ql, specs.model.yml")
+    else:
+        print(f"\n❌ Failed to process any runs for {project_name}")
+    
+    return success
+
+
 def main(root: str) -> None:
     """Main function to process all LLM run directories."""
     print(f"🔍 Searching for LLM run directories in: {root}")
@@ -915,6 +1027,11 @@ if __name__ == "__main__":
         help="Root directory containing the project folders. Defaults to 'output'.",
     )
     parser.add_argument(
+        "--project",
+        type=str,
+        help="Specific project name to build queries for. If provided, only this project will be processed.",
+    )
+    parser.add_argument(
         "--list-runs",
         action="store_true",
         help="List available LLM runs without processing them."
@@ -932,5 +1049,11 @@ if __name__ == "__main__":
                 project_name = os.path.basename(os.path.dirname(os.path.dirname(run_dir)))
                 run_name = os.path.basename(run_dir)
                 print(f"   📁 {project_name}/{run_name}")
+    elif args.project:
+        # Process specific project
+        success = build_project_specific_queries(args.project, args.root)
+        if not success:
+            exit(1)
     else:
+        # Process all projects
         main(args.root)
