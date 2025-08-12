@@ -66,6 +66,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 from typing import List, Dict, Any, Tuple
 
 
@@ -184,16 +185,15 @@ def aggregate_run_results(results_dir: str) -> List[Dict[str, Any]]:
 def build_sources_qll(entries: List[Dict[str, Any]]) -> str:
     """Create the contents of ``MySources.qll`` from a list of source entries.
 
-    The generated QLL file defines a custom ``TaintTracking`` configuration
-    which treats the return value of specific method calls as taint sources.
-    Each entry in ``entries`` must contain the keys ``package``, ``class``
-    and ``method``.  When no entries are provided the predicate simply
-    returns false.
+    The generated QLL file defines a predicate isLLMDetectedSource that identifies
+    API calls classified as sources by the LLM. Uses the new approach with 
+    exists clauses for each labeled API.
 
     Parameters
     ----------
     entries: list of dict
         A list of API descriptions classified as sources by the LLM.
+        Expected format: {"module": "module.name", "function": "func_name", ...}
 
     Returns
     -------
@@ -201,63 +201,61 @@ def build_sources_qll(entries: List[Dict[str, Any]]) -> str:
         The complete contents of a QLL file.
     """
     conditions: List[str] = []
+    
     for i, api in enumerate(entries):
         if not isinstance(api, dict):
             print(f"  ⚠️  Warning: Non-dict entry at index {i}: {type(api)} = {api}")
             continue
-        package = api.get("package")
-        clazz = api.get("class")
-        method = api.get("method")
-        if not method:
-            continue
+            
+        module_name = api.get("module", "")
+        func_name = api.get("function", "")
         
-        # Handle Python-specific patterns
-        if clazz and clazz != "":
-            # For class methods like flask.request.args.get
-            if package and package != "":
-                cond = (
-                    f"exists(Call call | "
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\" and "
-                    f"src.asCfgNode() = call)"
-                )
+        if not func_name:
+            continue
+            
+        # Parse module and function for CodeQL matching
+        if module_name and module_name != "":
+            if "." in module_name:
+                # Handle nested modules like airflow.utils.session
+                module_parts = module_name.split(".")
+                if len(module_parts) == 2:
+                    # Simple case: module.submodule
+                    cond = (f"exists(Call call | "
+                           f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{module_parts[0]}\" and "
+                           f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{module_parts[1]}\" and "
+                           f"call.getFunc().(Attribute).getAttr() = \"{func_name}\" and "
+                           f"src.asCfgNode() = call)")
+                else:
+                    # Multiple levels: airflow.utils.session -> use the last two parts
+                    base_module = ".".join(module_parts[:-1])
+                    final_module = module_parts[-1]
+                    cond = (f"exists(Call call | "
+                           f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{final_module}\" and "
+                           f"call.getFunc().(Attribute).getAttr() = \"{func_name}\" and "
+                           f"src.asCfgNode() = call)")
             else:
-                # For module-level class methods
-                cond = (
-                    f"exists(Call call | "
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\" and "
-                    f"src.asCfgNode() = call)"
-                )
+                # Single module name
+                cond = (f"exists(Call call | "
+                       f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{module_name}\" and "
+                       f"call.getFunc().(Attribute).getAttr() = \"{func_name}\" and "
+                       f"src.asCfgNode() = call)")
         else:
-            # For simple function calls like os.system, subprocess.run
-            if package and package != "":
-                cond = (
-                    f"exists(Call call | "
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\" and "
-                    f"src.asCfgNode() = call)"
-                )
-            else:
-                # For built-in functions
-                cond = (
-                    f"exists(Call call | "
-                    f"call.getFunc().(Name).getId() = \"{method}\" and "
-                    f"src.asCfgNode() = call)"
-                )
+            # Built-in function without module
+            cond = (f"exists(Call call | "
+                   f"call.getFunc().(Name).getId() = \"{func_name}\" and "
+                   f"src.asCfgNode() = call)")
+                   
         conditions.append(cond)
     
     body = "false" if not conditions else " or\n    ".join(conditions)
+    
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
-import semmle.python.Expr
 import semmle.python.ast.Call
 import semmle.python.ast.Name
 import semmle.python.ast.Attribute
-private import semmle.python.dataflow.new.DataFlow
 
-predicate isGPTDetectedSource(DataFlow::Node src) {{
+predicate isLLMDetectedSource(DataFlow::Node src) {{
     {body}
 }}
 """
@@ -267,15 +265,15 @@ predicate isGPTDetectedSource(DataFlow::Node src) {{
 def build_sinks_qll(entries: List[Dict[str, Any]]) -> str:
     """Create the contents of ``MySinks.qll`` from a list of sink entries.
 
-    Each entry should have ``package``, ``class``, ``method`` and
-    ``sink_args`` fields.  The generated predicate treats specific
-    arguments or the receiver of those method calls as sinks.  When no
-    entries are provided the predicate returns false.
+    The generated QLL file defines a predicate isLLMDetectedSink that identifies
+    API calls classified as sinks by the LLM. Uses the new approach with 
+    exists clauses for each labeled API and handles sink_args.
 
     Parameters
     ----------
     entries: list of dict
         A list of API descriptions classified as sinks by the LLM.
+        Expected format: {"module": "module.name", "function": "func_name", "sink_args": [...]}
 
     Returns
     -------
@@ -283,90 +281,78 @@ def build_sinks_qll(entries: List[Dict[str, Any]]) -> str:
         The complete contents of a QLL file.
     """
     conditions: List[str] = []
+    
     for i, api in enumerate(entries):
         if not isinstance(api, dict):
             print(f"  ⚠️  Warning: Non-dict entry in sinks at index {i}: {type(api)} = {api}")
             continue
-        package = api.get("package")
-        clazz = api.get("class")
-        method = api.get("method")
+            
+        module_name = api.get("module", "")
+        func_name = api.get("function", "")
         sink_args = api.get("sink_args", [])
-        if not method:
-            continue
         
-        arg_conditions: List[str] = []
-        # Normalise sink_args to a list
+        if not func_name:
+            continue
+            
+        # Normalize sink_args to a list
         if isinstance(sink_args, str):
             sink_args = [sink_args]
         if not isinstance(sink_args, list):
             sink_args = []
-        
-        # Build the call pattern first
-        if clazz and clazz != "":
-            # For class methods like flask.request.args.get
-            if package and package != "":
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
+            
+        # Build call pattern
+        if module_name and module_name != "":
+            if "." in module_name:
+                module_parts = module_name.split(".")
+                if len(module_parts) == 2:
+                    call_pattern = (f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{module_parts[0]}\" and "
+                                   f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{module_parts[1]}\" and "
+                                   f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
+                else:
+                    final_module = module_parts[-1]
+                    call_pattern = (f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{final_module}\" and "
+                                   f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
             else:
-                # For module-level class methods
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
+                call_pattern = (f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{module_name}\" and "
+                               f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
         else:
-            # For simple function calls like os.system, subprocess.run
-            if package and package != "":
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
-            else:
-                # For built-in functions
-                call_pattern = f"call.getFunc().(Name).getId() = \"{method}\""
-        
+            call_pattern = f"call.getFunc().(Name).getId() = \"{func_name}\""
+            
+        # Build argument conditions
+        arg_conditions: List[str] = []
         for arg in sink_args:
             if isinstance(arg, str):
                 arg = arg.strip()
-                if arg.lower() == "this":
-                    # In Python, "this" would be the object being called on
-                    arg_conditions.append("snk.asCfgNode() = call.getFunc().(Attribute).getObject()")
-                else:
-                    # Extract argument index
-                    if arg.isdigit():
-                        idx = int(arg)
-                        arg_conditions.append(f"snk.asCfgNode() = call.getArg({idx})")
-                    elif arg.startswith('arg') and arg[3:].isdigit():
-                        idx = int(arg[3:])
-                        arg_conditions.append(f"snk.asCfgNode() = call.getArg({idx})")
-                    elif arg.startswith('p') and arg[1:].isdigit():
-                        idx = int(arg[1:])
-                        arg_conditions.append(f"snk.asCfgNode() = call.getArg({idx})")
-        
-        # When no sink arguments are specified, use first argument as default
+                if arg.isdigit():
+                    idx = int(arg)
+                    arg_conditions.append(f"snk.asCfgNode() = call.getArg({idx})")
+                elif arg.lower() in ['0', 'first', 'arg0']:
+                    arg_conditions.append("snk.asCfgNode() = call.getArg(0)")
+                elif arg.lower() in ['1', 'second', 'arg1']:
+                    arg_conditions.append("snk.asCfgNode() = call.getArg(1)")
+                elif arg.lower() in ['2', 'third', 'arg2']:
+                    arg_conditions.append("snk.asCfgNode() = call.getArg(2)")
+                    
+        # Default to first argument if no sink_args specified
         if not arg_conditions:
             arg_conditions.append("snk.asCfgNode() = call.getArg(0)")
-        
+            
         arg_body = " or ".join(arg_conditions)
-        cond = (
-            f"exists(Call call | "
-            f"{call_pattern} and "
-            f"({arg_body}))"
-        )
+        cond = (f"exists(Call call | "
+               f"{call_pattern} and "
+               f"({arg_body}))")
+               
         conditions.append(cond)
     
     body = "false" if not conditions else " or\n    ".join(conditions)
+    
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
-import semmle.python.Expr
 import semmle.python.ast.Call
 import semmle.python.ast.Name
 import semmle.python.ast.Attribute
-private import semmle.python.dataflow.new.DataFlow
 
-predicate isGPTDetectedSink(DataFlow::Node snk) {{
+predicate isLLMDetectedSink(DataFlow::Node snk) {{
     {body}
 }}
 """
@@ -376,15 +362,15 @@ predicate isGPTDetectedSink(DataFlow::Node snk) {{
 def build_summaries_qll(entries: List[Dict[str, Any]]) -> str:
     """Create the contents of ``MySummaries.qll`` from taint‑propagator entries.
 
-    Each entry must have ``package``, ``class`` and ``method``.  The
-    predicate defines an additional taint step that propagates taint from
-    the arguments of the call to its return value.  When no entries are
-    provided the predicate returns false.
+    The generated QLL file defines a predicate isLLMDetectedStep that identifies
+    API calls classified as propagators by the LLM. Uses the new approach with 
+    exists clauses for each labeled API.
 
     Parameters
     ----------
     entries: list of dict
         A list of API descriptions classified as taint‑propagators by the LLM.
+        Expected format: {"module": "module.name", "function": "func_name", ...}
 
     Returns
     -------
@@ -392,60 +378,52 @@ def build_summaries_qll(entries: List[Dict[str, Any]]) -> str:
         The complete contents of a QLL file.
     """
     conditions: List[str] = []
+    
     for i, api in enumerate(entries):
         if not isinstance(api, dict):
             print(f"  ⚠️  Warning: Non-dict entry in taint-propagators at index {i}: {type(api)} = {api}")
             continue
-        package = api.get("package")
-        clazz = api.get("class")
-        method = api.get("method")
-        if not method:
+            
+        module_name = api.get("module", "")
+        func_name = api.get("function", "")
+        
+        if not func_name:
             continue
-        
-        # Build the call pattern for Python taint propagation
-        if clazz and clazz != "":
-            # For class methods like pathlib.Path.joinpath
-            if package and package != "":
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
+            
+        # Build call pattern
+        if module_name and module_name != "":
+            if "." in module_name:
+                module_parts = module_name.split(".")
+                if len(module_parts) == 2:
+                    call_pattern = (f"call.getFunc().(Attribute).getObject().(Attribute).getObject().(Name).getId() = \"{module_parts[0]}\" and "
+                                   f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{module_parts[1]}\" and "
+                                   f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
+                else:
+                    final_module = module_parts[-1]
+                    call_pattern = (f"call.getFunc().(Attribute).getObject().(Attribute).getAttr() = \"{final_module}\" and "
+                                   f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
             else:
-                # For module-level class methods
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{clazz}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
+                call_pattern = (f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{module_name}\" and "
+                               f"call.getFunc().(Attribute).getAttr() = \"{func_name}\"")
         else:
-            # For simple function calls like str.join, str.replace
-            if package and package != "":
-                call_pattern = (
-                    f"call.getFunc().(Attribute).getObject().(Name).getId() = \"{package}\" and "
-                    f"call.getFunc().(Attribute).getAttr() = \"{method}\""
-                )
-            else:
-                # For built-in functions
-                call_pattern = f"call.getFunc().(Name).getId() = \"{method}\""
-        
-        cond = (
-            f"exists(Call call | "
-            f"(call.getArg(_) = prev.asCfgNode() or call.getFunc().(Attribute).getObject() = prev.asCfgNode()) and "
-            f"{call_pattern} and "
-            f"call = next.asCfgNode())"
-        )
+            call_pattern = f"call.getFunc().(Name).getId() = \"{func_name}\""
+            
+        cond = (f"exists(Call call | "
+               f"(call.getArg(_) = prev.asCfgNode() or call.getFunc().(Attribute).getObject() = prev.asCfgNode()) and "
+               f"{call_pattern} and "
+               f"call = next.asCfgNode())")
+               
         conditions.append(cond)
     
     body = "false" if not conditions else " or\n    ".join(conditions)
+    
     qll = f"""import python
 import semmle.python.dataflow.new.DataFlow
-import semmle.python.Expr
 import semmle.python.ast.Call
 import semmle.python.ast.Name
 import semmle.python.ast.Attribute
-private import semmle.python.dataflow.new.DataFlow
 
-predicate isGPTDetectedStep(DataFlow::Node prev, DataFlow::Node next) {{
+predicate isLLMDetectedStep(DataFlow::Node prev, DataFlow::Node next) {{
     {body}
 }}
 """
@@ -483,11 +461,11 @@ import MySummaries
  */
 module MyTaintedPathConfig implements DataFlow::ConfigSig {
   predicate isSource(DataFlow::Node source) {
-    isGPTDetectedSource(source)
+    isLLMDetectedSource(source)
   }
 
   predicate isSink(DataFlow::Node sink) {
-    isGPTDetectedSink(sink)
+    isLLMDetectedSink(sink)
   }
 
   predicate isBarrier(DataFlow::Node sanitizer) {
@@ -499,7 +477,7 @@ module MyTaintedPathConfig implements DataFlow::ConfigSig {
   }
 
   predicate isAdditionalFlowStep(DataFlow::Node n1, DataFlow::Node n2) {
-    isGPTDetectedStep(n1, n2)
+    isLLMDetectedStep(n1, n2)
   }
 }
 
@@ -517,7 +495,7 @@ module MyTaintedPathSinksOnlyConfig implements DataFlow::ConfigSig {
   }
 
   predicate isSink(DataFlow::Node sink) {
-    isGPTDetectedSink(sink)
+    isLLMDetectedSink(sink)
   }
 
   predicate isBarrier(DataFlow::Node sanitizer) {
@@ -542,7 +520,7 @@ module MyTaintedPathFlowSinksOnly = TaintTracking::Global<MyTaintedPathSinksOnly
  */
 module MyTaintedPathSourcesOnlyConfig implements DataFlow::ConfigSig {
   predicate isSource(DataFlow::Node source) {
-    isGPTDetectedSource(source)
+    isLLMDetectedSource(source)
   }
 
   predicate isSink(DataFlow::Node sink) {
@@ -819,8 +797,15 @@ def process_run(run_path: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     
     # Extract project name from the run path
-    # run_path structure: .../output/project_name/api_labelling/model_run/
-    project_name = os.path.basename(os.path.dirname(os.path.dirname(run_path)))
+    # Handle both legacy and new directory structures:
+    # Legacy: .../output/project_name/api_labelling/model_run/
+    # New: .../output/project_name/model_run/
+    if "/api_labelling/" in run_path:
+        # Legacy structure
+        project_name = os.path.basename(os.path.dirname(os.path.dirname(run_path)))
+    else:
+        # New structure
+        project_name = os.path.basename(os.path.dirname(run_path))
     
     # Build and write QLL files
     try:
@@ -843,6 +828,42 @@ def process_run(run_path: str) -> None:
             f.write(cwe_022_qll)
         with open(os.path.join(out_dir, "specs.model.yml"), "w", encoding="utf-8") as f:
             f.write(specs_model_yml)
+        
+        # Generate qlpack.yml file
+        qlpack_yml = f"""name: {project_name}-llm-queries
+version: 1.0.0
+description: LLM-generated Python queries for {project_name} SAST analysis
+dependencies:
+  codeql/python-all: "*"
+"""
+        with open(os.path.join(out_dir, "qlpack.yml"), "w", encoding="utf-8") as f:
+            f.write(qlpack_yml)
+        
+        # Run codeql pack install
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["codeql", "pack", "install"],
+                cwd=out_dir,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0:
+                print(f"      - qlpack.yml (CodeQL pack configuration)")
+                print(f"      - ✅ codeql pack install completed successfully")
+            else:
+                print(f"      - qlpack.yml (CodeQL pack configuration)")
+                print(f"      - ⚠️  codeql pack install failed: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            print(f"      - qlpack.yml (CodeQL pack configuration)")
+            print(f"      - ⚠️  codeql pack install timed out")
+        except FileNotFoundError:
+            print(f"      - qlpack.yml (CodeQL pack configuration)")
+            print(f"      - ⚠️  codeql command not found - install CodeQL CLI")
+        except Exception as e:
+            print(f"      - qlpack.yml (CodeQL pack configuration)")
+            print(f"      - ⚠️  codeql pack install error: {e}")
         
         print(f"  ✅ Generated Python CodeQL libraries and query files in custom_codeql_library/")
         print(f"      - MySources.qll ({len(sources)} sources)")
@@ -884,21 +905,34 @@ def find_run_directories(root: str) -> List[str]:
         if not os.path.isdir(project_path):
             continue
         
-        # Check if this project has api_labelling directory
+        # Check if this project has api_labelling directory (legacy structure)
         api_labelling_path = os.path.join(project_path, "api_labelling")
-        if not os.path.isdir(api_labelling_path):
-            continue
+        if os.path.isdir(api_labelling_path):
+            # Look for run directories inside api_labelling
+            for run_name in os.listdir(api_labelling_path):
+                run_path = os.path.join(api_labelling_path, run_name)
+                if not os.path.isdir(run_path):
+                    continue
+                
+                # Check if it has labeled_apis.json file
+                labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
+                if os.path.exists(labeled_apis_path):
+                    run_paths.append(run_path)
         
-        # Look for run directories inside api_labelling
-        for run_name in os.listdir(api_labelling_path):
-            run_path = os.path.join(api_labelling_path, run_name)
-            if not os.path.isdir(run_path):
+        # Also check for run directories directly under project (new structure)
+        for item_name in os.listdir(project_path):
+            item_path = os.path.join(project_path, item_name)
+            if not os.path.isdir(item_path):
                 continue
             
-            # Check if it has labeled_apis.json file
-            labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
+            # Skip known non-run directories
+            if item_name in ['api_candidates', 'api_labelling', 'fetch_apis', 'project-sources']:
+                continue
+                
+            # Check if this looks like a run directory (has labeled_apis.json)
+            labeled_apis_path = os.path.join(item_path, "labeled_apis.json")
             if os.path.exists(labeled_apis_path):
-                run_paths.append(run_path)
+                run_paths.append(item_path)
     return run_paths
 
 
@@ -924,29 +958,44 @@ def build_project_specific_queries(project_name: str, root: str = "output") -> b
         print(f"❌ Project directory not found: {project_path}")
         return False
     
-    # Find API labelling directory
+    # Find API labelling directory (legacy structure)
     api_labelling_path = os.path.join(project_path, "api_labelling")
-    if not os.path.isdir(api_labelling_path):
-        print(f"❌ No API labelling directory found: {api_labelling_path}")
-        return False
     
     # Find run directories with labeled results
     run_dirs = []
-    for run_name in os.listdir(api_labelling_path):
-        run_path = os.path.join(api_labelling_path, run_name)
-        if not os.path.isdir(run_path):
+    
+    # First, check legacy structure: project/api_labelling/run_dirs/
+    if os.path.isdir(api_labelling_path):
+        for run_name in os.listdir(api_labelling_path):
+            run_path = os.path.join(api_labelling_path, run_name)
+            if not os.path.isdir(run_path):
+                continue
+            
+            # Check for labeled_apis.json (new structure) or results directory (old structure)
+            labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
+            results_dir = os.path.join(run_path, "results")
+            
+            if os.path.exists(labeled_apis_path) or os.path.isdir(results_dir):
+                run_dirs.append(run_path)
+    
+    # Second, check new structure: project/run_dirs/ (directly under project)
+    for item_name in os.listdir(project_path):
+        item_path = os.path.join(project_path, item_name)
+        if not os.path.isdir(item_path):
             continue
         
-        # Check for labeled_apis.json (new structure) or results directory (old structure)
-        labeled_apis_path = os.path.join(run_path, "labeled_apis.json")
-        results_dir = os.path.join(run_path, "results")
-        
-        if os.path.exists(labeled_apis_path) or os.path.isdir(results_dir):
-            run_dirs.append(run_path)
+        # Skip known non-run directories
+        if item_name in ['api_candidates', 'api_labelling', 'fetch_apis', 'project-sources']:
+            continue
+            
+        # Check if this looks like a run directory (has labeled_apis.json)
+        labeled_apis_path = os.path.join(item_path, "labeled_apis.json")
+        if os.path.exists(labeled_apis_path):
+            run_dirs.append(item_path)
     
     if not run_dirs:
-        print(f"❌ No LLM run directories found in {api_labelling_path}")
-        print(f"💡 Expected structure: {project_name}/api_labelling/<model_run>/labeled_apis.json")
+        print(f"❌ No LLM run directories found in {project_path}")
+        print(f"💡 Expected structure: {project_name}/<model_run>/labeled_apis.json or {project_name}/api_labelling/<model_run>/labeled_apis.json")
         return False
     
     print(f"✅ Found {len(run_dirs)} LLM run directories for {project_name}:")
@@ -973,7 +1022,7 @@ def build_project_specific_queries(project_name: str, root: str = "output") -> b
     if success:
         print(f"\n🎉 Completed! Processed {processed_count}/{len(run_dirs)} run directories for {project_name}.")
         print(f"📁 Generated Python CodeQL libraries in: {project_name}/api_labelling/*/custom_codeql_library/")
-        print(f"📄 Files created: MySources.qll, MySinks.qll, MySummaries.qll, MyTaintedPathQuery.qll, cwe-022wLLM.ql, specs.model.yml")
+        print(f"📄 Files created: MySources.qll, MySinks.qll, MySummaries.qll, MyTaintedPathQuery.qll, cwe-022wLLM.ql, specs.model.yml, qlpack.yml")
     else:
         print(f"\n❌ Failed to process any runs for {project_name}")
     
@@ -1015,7 +1064,7 @@ def main(root: str) -> None:
     print(f"\n🎉 Completed! Processed {processed_count}/{len(run_dirs)} run directories.")
     if processed_count > 0:
         print(f"📁 Generated Python CodeQL libraries in: */api_labelling/*/custom_codeql_library/")
-        print(f"📄 Files created: MySources.qll, MySinks.qll, MySummaries.qll, MyTaintedPathQuery.qll, cwe-022wLLM.ql, specs.model.yml")
+        print(f"📄 Files created: MySources.qll, MySinks.qll, MySummaries.qll, MyTaintedPathQuery.qll, cwe-022wLLM.ql, specs.model.yml, qlpack.yml")
 
 
 if __name__ == "__main__":

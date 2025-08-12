@@ -214,4 +214,4 @@ output/
 data/codeql-dbs/
 *.lock.yml
 _*iris*
-*log*
+_logs/
